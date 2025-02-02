@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  pytorch:
+    image: nvcr.io/nvidia/pytorch:24.09-py3
+    runtime: nvidia
+    ipc: host
+    ulimits:
+      memlock: -1
+      # stack: 67108864  # 可以先注释掉，使用默认值
+    stdin_open: true
+    tty: true
+    ports:
+      - "8888:8888"  # 将容器的 8888 端口映射到主机的 8888 端口（Jupyter Notebook 默认端口）
+    volumes:
+      - .:/workspace  # 将当前目录映射到容器内的 /workspace 目录
+    working_dir: /workspace  # 设置容器启动后的工作目录为 /workspace
+    command: jupyter notebook --ip=0.0.0.0 --port=8888 --no-browser --allow-root
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
