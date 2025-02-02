@@ -8,11 +8,16 @@ import torch.backends.mps
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard.writer import SummaryWriter
+from torchvision.transforms import Normalize
+from torch.optim.lr_scheduler import StepLR, ReduceLROnPlateau, MultiStepLR, CyclicLR, LambdaLR
 import matplotlib.pyplot as plt
+from copy import deepcopy
 
 plt.style.use('fivethirtyeight')
 
 # 一个完全空的类
+
+
 class StepByStep(object):
     def __init__(self, model, loss_fn, optimizer):
         # 这里定义类的属性
@@ -26,6 +31,8 @@ class StepByStep(object):
         self.train_loader = None
         self.val_loader = None
         self.writer = None
+
+        self._gradients = {}
 
         # 这些属性将在内部计算
         self.losses = []
@@ -265,7 +272,8 @@ class StepByStep(object):
                     ax.text(jj, ii, f'{val:.2f}', ha='center',
                             va='center', color='red', fontsize=8)
 
-    def visualize_filter(self, layer_name, **kwargs):
+    def visualize_filter(self, layer_name, img_value=True, **kwargs):
+        """layer_name: layer的名称, kwargs: {"img_value": bool=True}"""
         try:
             # 从模型中获取层对象
             layer = self.model
@@ -290,6 +298,7 @@ class StepByStep(object):
                         weights[i],
                         layer_name=f'Filter #{i}',
                         title='Channel',
+                        img_value=img_value,
                     )
 
                 fig.tight_layout()
@@ -431,3 +440,143 @@ class StepByStep(object):
             results = results.float().mean(axis=0)
 
         return results
+
+    @staticmethod
+    def statistics_per_channel(images, labels):
+        # 获取输入图像的形状 (n_samples, n_channels, n_height, n_width)
+        n_samples, n_channels, n_height, n_width = images.size()
+
+        # 将每个通道的像素展平为 1 维
+        flatten_per_channel = images.reshape(n_samples, n_channels, -1)
+
+        # 计算每个通道每幅图像的统计数据
+        # 每个通道像素的平均值 (n_samples, n_channels)
+        means = flatten_per_channel.mean(axis=2)
+        # 每个通道像素的标准差 (n_samples, n_channels)
+        stds = flatten_per_channel.std(axis=2)
+
+        # 计算整个小批量中所有图像的统计量
+        sum_means = means.sum(axis=0)  # 所有图像在每个通道上的像素平均值之和 (n_channels,)
+        sum_stds = stds.sum(axis=0)    # 所有图像在每个通道上的像素标准差之和 (n_channels,)
+        n_samples = torch.tensor(
+            [n_samples] * n_channels).float()  # 样本数量 (n_channels,)
+
+        # 将统计量堆叠在一起 (3, n_channels)
+        return torch.stack([n_samples, sum_means, sum_stds], axis=0)
+
+    @staticmethod
+    def make_normalizer(loader):
+        total_samples, total_means, total_stds = \
+            StepByStep.loader_apply(loader, StepByStep.statistics_per_channel)
+        norm_mean = total_means / total_samples
+        norm_std = total_stds / total_samples
+
+        return Normalize(mean=norm_mean, std=norm_std)
+
+    @staticmethod
+    def make_lr_fn(start_lr, end_lr, num_iter, step_mode='exp'):
+        if step_mode == 'linear':
+            factor = (end_lr / start_lr - 1) / num_iter
+
+            def lr_fn(iteration):
+                return 1 + iteration * factor
+
+        else:
+            factor = (np.log(end_lr) - np.log(start_lr)) / num_iter
+
+            def lr_fn(iteration):
+                return np.exp(factor) ** iteration
+        return lr_fn
+
+    def lr_range_test(self, data_loader, end_lr, num_iter=100, step_mode='exp', alpha=0.05, ax=None):
+        # 由于测试更新了模型和优化器
+        # 所以需要存储它们的初始状态以在最后恢复它们
+        previous_states = {"model": deepcopy(self.model.state_dict()),
+                           "optimizer": deepcopy(self.optimizer.state_dict())}
+
+        # 检索优化器中设置的学习率
+        start_lr = self.optimizer.state_dict()['param_groups'][0]['lr']
+
+        # 构建自定义函数和相应的调度器
+        lr_fn = StepByStep.make_lr_fn(start_lr, end_lr, num_iter)
+        scheduler = LambdaLR(self.optimizer, lr_lambda=lr_fn)
+
+        # 跟踪结果和迭代的变量
+        tracking = {'loss': [], 'lr': [], }
+        iteration = 0
+
+        # 如果数据加载器中迭代次数多于小批量
+        # 则必须多次循环
+        while (iteration < num_iter):
+            # 这是典型的小批量内循环
+            for x_batch, y_batch in data_loader:
+                x_batch, y_batch = x_batch.to(
+                    self.device), y_batch.to(self.device)
+
+                # 步骤1
+                yhat = self.model(x_batch)
+                # 步骤2
+                loss = self.loss_fn(yhat, y_batch)
+                # 步骤3
+                loss.backward()
+
+                # 在这里，跟踪损失（平滑）和学习率
+                tracking['lr'].append(scheduler.get_last_lr()[0])
+                if iteration == 0:
+                    tracking['loss'].append(loss.item())
+                else:
+                    prev_loss = tracking['loss'][-1]
+                    smoothed_loss = alpha * loss.item() + (1 - alpha) * prev_loss
+                    tracking['loss'].append(smoothed_loss)
+
+                iteration += 1
+                # 达到迭代次数
+                if iteration == num_iter:
+                    break
+
+                # 步骤4
+                self.optimizer.step()
+                scheduler.step()
+                self.optimizer.zero_grad()
+
+        # 恢复初始状态
+        self.optimizer.load_state_dict(previous_states['optimizer'])
+        self.model.load_state_dict(previous_states['model'])
+
+        if ax is None:
+            fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        else:
+            fig = ax.get_figure()
+        ax.plot(tracking['lr'], tracking['loss'])
+        if step_mode == 'exp':
+            ax.set_xscale('log')
+        ax.set_xlabel('Learing Rate')
+        ax.set_ylabel('Loss')
+        fig.tight_layout()
+        return tracking, fig
+
+    def set_optimizer(self, optimizer):
+        self.optimizer = optimizer
+
+    def capture_gradients(self, layers_to_hook):
+        if not isinstance(layers_to_hook, list):
+            layers_to_hook = [layers_to_hook]
+        
+        # modules = list(self.model.named_modules())
+        self._gradients = {}
+
+        def make_log_fn(name, param_id):
+            def log_fn(grad):
+                self._gradients[name][param_id].append(grad.tolist())
+                return
+            return log_fn
+        
+        for name, layer in self.model.named_layers():
+            if name in layers_to_hook:
+                self._gradients.update({name: {}})
+                for param_id, p in layer.named_parameters():
+                    if p.requires_grad:
+                        self._gradients[name].update({param_id: []})
+                        log_fn = make_log_fn(name, param_id)
+                        self.handles[f'{name}.{param_id}.grad'] = p.register_hook(log_fn)
+        return
